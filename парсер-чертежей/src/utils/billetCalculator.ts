@@ -29,31 +29,48 @@ export function formatKdBilletString(billetLength: number, billetCount: number):
 
 /**
  * Parses numeric part length in mm from string inputs like:
- * "180 мм", "340", "L=240", "125.5", "Ø32х190", etc.
+ * "180 мм", "340", "L=240", "125,5", "Ø32х190", "М8х25", etc.
+ * Robust against Cyrillic decimal commas, spaces and unit suffixes.
  */
 export function parsePartLengthMm(partLengthStr?: string): number | null {
   if (!partLengthStr) return null;
-  const str = String(partLengthStr).trim().replace(',', '.');
-  if (!str) return null;
+  const raw = String(partLengthStr).trim();
+  if (!raw) return null;
 
-  // Try extracting L=... or length after 'x' / 'х'
-  const matchL = str.match(/L\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)/i);
+  // Threaded fasteners: "М8х25" / "M10*50" -> length is the value after х/x/*
+  const threadMatch = raw.match(/(?:м|m)\s*\d+(?:[.,]\d+)?\s*(?:-\s*[\w\d]+?\s*)?[хx×*]\s*(\d+(?:[.,]\d+)?)/i);
+  if (threadMatch) {
+    const val = parseFloat(threadMatch[1].replace(',', '.'));
+    if (!isNaN(val) && val > 0) return val;
+  }
+
+  // Explicit L label: "Lзаг" excluded, "L=240", "L 240 мм"
+  const matchL = raw.match(/\bL(?!заг)[а-яёa-z]*\s*[:=]?\s*(\d+(?:[.,]\d+)?)/iu);
   if (matchL) {
-    const val = parseFloat(matchL[1]);
+    const val = parseFloat(matchL[1].replace(',', '.'));
     if (!isNaN(val) && val > 0) return val;
   }
 
-  // Try extracting dimensions after 'х' or 'x' e.g. "Ø32х190" -> 190
-  const matchX = str.match(/[хx]\s*([0-9]+(?:\.[0-9]+)?)/i);
+  // Diameter x length combos: "Ø32х190", "32×190" -> take the largest of the two numbers
+  const matchX = raw.match(/(\d+(?:[.,]\d+)?)\s*[хx×]\s*(\d+(?:[.,]\d+)?)/iu);
   if (matchX) {
-    const val = parseFloat(matchX[1]);
+    const a = parseFloat(matchX[1].replace(',', '.'));
+    const b = parseFloat(matchX[2].replace(',', '.'));
+    const val = Math.max(a, b);
     if (!isNaN(val) && val > 0) return val;
   }
 
-  // General first numeric match
-  const matchNum = str.match(/([0-9]+(?:\.[0-9]+)?)/);
+  // Dimension with units anywhere: "240 мм", "1 250mm"
+  const matchUnits = raw.match(/(\d{1,4}(?:\s?\d{3})?(?:[.,]\d+)?)\s*(?:мм|mm)(?![\p{L}\p{N}])/iu);
+  if (matchUnits) {
+    const val = parseFloat(matchUnits[1].replace(/\s/g, '').replace(',', '.'));
+    if (!isNaN(val) && val > 0) return val;
+  }
+
+  // General numeric match (thousand groups supported: "1 200")
+  const matchNum = raw.match(/(\d{1,3}(?:[\s]\d{3})+|\d+(?:[.,]\d+)?)/u);
   if (matchNum) {
-    const val = parseFloat(matchNum[1]);
+    const val = parseFloat(matchNum[1].replace(/\s/g, '').replace(',', '.'));
     if (!isNaN(val) && val > 0) return val;
   }
 

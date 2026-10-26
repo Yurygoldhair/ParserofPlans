@@ -1,5 +1,6 @@
 import { createWorker, PSM, type Worker } from 'tesseract.js';
 import { DrawingItem, SECTIONS, SectionType } from '../types';
+import { parsePartLengthMm } from './billetCalculator';
 import { loadPdfDocument } from './pdfRenderer';
 
 type PdfTextItem = {
@@ -53,6 +54,16 @@ function isRodOrStudSectionTitle(text: string): boolean {
   return /прут(?:ки|ок)\s*(?:и\s*)?[\/,&+]?\s*шпильк|мерный\s+сортовой\s+прокат/iu.test(normalized);
 }
 
+const DESIGNATION_TOKEN_PATTERN = /(?:\bГОСТ\s*\d+(?:[.\-]\d+)*(-\s*\d{2,4})?\b|\bОСТ\s*\d+(?:[.\-]\d+)*(-\s*\d{2,4})?\b|\bТУ\s*[\wА-ЯЁ.\-]+\b|\bDIN\s*\d+\b|\bISO\s*\d+\b|(?:[A-ZА-ЯЁ]{1,8}\s*\.\s*)?\d{6}(?:\s*[.-]\s*\d{2,4}){1,3}|[A-ZА-ЯЁ]{1,8}\.\d{2,6}(?:\.\d{2,4})?(?:\.\d{1,2})?)/iu;
+
+/** Extracts the single designation token from a line (used for OCR title-block cells). */
+function extractDesignationToken(line: string): string {
+  const match = line.match(DESIGNATION_TOKEN_PATTERN);
+  if (!match) return '';
+  const raw = (match[1] || match[2]) ? match[0] : match[0];
+  return raw.replace(/\s+/g, ' ').trim();
+}
+
 function findDesignation(lines: string[]): string {
   const patterns = [
     /(?:^|[^A-ZА-ЯЁ0-9])((?:ГОСТ|ОСТ|ТУ|DIN|ISO)\s*[\wА-ЯЁ./-]+)/iu,
@@ -79,6 +90,16 @@ function findDesignation(lines: string[]): string {
   return '';
 }
 
+/**
+ * Cleans up an OCR'd designation cell: removes spaces inside the code,
+ * strips trailing garbage after the code token.
+ */
+function normalizeDesignationCell(text: string): string {
+  const compact = text.replace(/\s+/g, ' ').trim();
+  const token = extractDesignationToken(compact);
+  return token || compact;
+}
+
 function isSectionDivider(text: string, designation: string): boolean {
   if (designation) return false;
   const normalized = text.toLowerCase().replace(/\s+/g, ' ').trim();
@@ -87,18 +108,59 @@ function isSectionDivider(text: string, designation: string): boolean {
   return (hasKnownTitle || isRodTitle) && normalized.length < 500;
 }
 
+const NAME_STOP_WORDS = /^(?:обозначени[ея]|наименовани[ея]|материал|масштаб|лист|формат|литра|масса|подп\.|дата|разраб|пров|утв|н\.\s*контр|гост|ост|ту|din|iso|кол[\s.\-_]*во|количество|шт|pcs|примечан|техн\.?\s*требован)/iu;
+
+/**
+ * Extracts the part name from a line that may be a concatenation of several
+ * title-block cells (e.g. "Втулка 32 Сталь 45 12" or "Обозначение АБВГ.711142.012 Наименование Вал-шестерня").
+ */
+function extractNameFromMixedLine(line: string): string {
+  let work = line.trim();
+  // Cut off everything from the next field label onwards
+  const cutPoints = [
+    /\b(?:обозначени[ея]|материал|масштаб|литра|лист\s*\d|формат|масса|кол[\s.\-_]*во|количество)\b/iu,
+    /(?:сталь|Ст)\s*[А-ЯЁA-Z0-9Хх.\-]+/u,
+    /[А-Яа-яёЁ]{2,}\s+Д?\d{1,3}(?:[А-ЯЁ]|[Тт][Уу])?\b/u, // e.g. "Втулка 45", but keeps "Вал-шестерня"
+  ];
+  for (const pattern of cutPoints) {
+    const match = work.match(pattern);
+    if (match && match.index !== undefined && match.index > 0) {
+      work = work.slice(0, match.index).trim();
+    }
+  }
+  // Strip leading/trailing pure-number tokens (dimensions, quantities)
+  work = work.replace(/^(?:[\dØФ§≤≥±.,хx]+\s*)+/iu, '').replace(/\s+(?:[№]\s*)?[\d.,хxØФ§]+$/iu, '').trim();
+  return work;
+}
+
+function isPlausibleName(candidate: string): boolean {
+  const value = candidate.trim();
+  if (value.length < 2 || value.length > 80) return false;
+  if (NAME_STOP_WORDS.test(value)) return false;
+  if (/^[\d\s.,:+/*×хx=-]+$/u.test(value)) return false;
+  if (/[а-яёa-z]/iu.test(value) === false) return false;
+  // Reject OCR garbage: too many non-letter chars relative to letters
+  const letters = (value.match(/[а-яёa-z]/giu) || []).length;
+  if (letters / value.replace(/\s/g, '').length < 0.5) return false;
+  return true;
+}
+
 function findName(lines: string[], designation: string): string {
   for (let index = 0; index < lines.length; index++) {
     const label = lines[index].match(/наименовани[ея](?=$|[\s:=])\s*[:=]?\s*(.*)$/iu);
     if (!label) continue;
     const inlineValue = label[1].trim();
-    if (inlineValue.length >= 2 && !/^(?:обозначение|материал|масштаб|лист|формат)(?=$|[\s:=])/iu.test(inlineValue)) {
-      return inlineValue.slice(0, 100);
+    if (inlineValue.length >= 2 && !NAME_STOP_WORDS.test(inlineValue)) {
+      const cleaned = extractNameFromMixedLine(inlineValue);
+      if (isPlausibleName(cleaned)) return cleaned.slice(0, 100);
+      if (isPlausibleName(inlineValue)) return inlineValue.slice(0, 100);
     }
 
     const nextLine = lines[index + 1]?.trim();
-    if (nextLine && nextLine.length >= 2 && !/^(?:обозначение|материал|масштаб|лист|формат)(?=$|[\s:=])/iu.test(nextLine)) {
-      return nextLine.slice(0, 100);
+    if (nextLine && nextLine.length >= 2 && !NAME_STOP_WORDS.test(nextLine)) {
+      const cleaned = extractNameFromMixedLine(nextLine);
+      if (isPlausibleName(cleaned)) return cleaned.slice(0, 100);
+      if (isPlausibleName(nextLine)) return nextLine.slice(0, 100);
     }
   }
 
@@ -107,13 +169,15 @@ function findName(lines: string[], designation: string): string {
     : -1;
   const candidates = lines.filter(line => {
     if (line.length < 3 || line.length > 100) return false;
-    if (/^(?:наименовани[ея]|обозначение|материал|масштаб|лист|формат|разраб\.|пров\.|утв\.)(?=$|[\s:=])/iu.test(line)) return false;
+    if (NAME_STOP_WORDS.test(line)) return false;
     if (/^(?:ГОСТ|ОСТ|ТУ|DIN|ISO)\b/iu.test(line)) return false;
-    if (/^(?:сталь|материал|масштаб|лист|формат|масса|подп\.|дата)\b/iu.test(line)) return false;
-    if (/^[\d\s.,:+/×хx=-]+$/iu.test(line)) return false;
     if (designation && line.toLowerCase().includes(designation.toLowerCase())) return false;
-    return /[а-яё]{3,}/iu.test(line);
-  });
+    // Reject lines that are mostly drawing designators or dimension strings
+    if (/(?:[A-ZА-ЯЁ]{1,8}\.)?\d{2,}(?:[.-]\d{2,}){2,4}/u.test(line)) return false;
+    if (/^[~≤≥<> ]*\d+(?:[.,]\d+)?\s*(?:±|мм|mm)?$/iu.test(line)) return false;
+    if (!isPlausibleName(line)) return false;
+    return /[а-яё]{2,}/iu.test(line);
+  }).map(line => extractNameFromMixedLine(line)).filter(line => isPlausibleName(line));
 
   if (designationIndex >= 0) {
     const nearby = candidates
@@ -126,7 +190,8 @@ function findName(lines: string[], designation: string): string {
 }
 
 function isValidTitleBlockName(name: string): boolean {
-  return /^[A-ZА-ЯЁ][^\r\n]{1,99}$/u.test(name.trim());
+  const value = name.trim();
+  return /^[A-ZА-ЯЁ][^\r\n]{1,99}$/u.test(value) && isPlausibleName(value);
 }
 
 function findQuantity(text: string): number | null {
@@ -136,29 +201,61 @@ function findQuantity(text: string): number | null {
   return pieces ? Number(pieces[1]) : null;
 }
 
+/**
+ * Extracts the maximum axial (length) dimension of a rotation/part from drawing text.
+ * Handles: "L=240 мм", "Длина 180", "Ø32х190", "32×190", "190±0,5", "125.5", bare numeric lines.
+ * Ignores diameter-only tokens, thread sizes (М8х25 handled separately), scale, mass, page numbers.
+ */
 function findLength(text: string, quantity: number | null, pageNumber: number): string {
   const normalizedLines = cleanLines(text).filter(line =>
-    !/масштаб|масса|количеств|кол[\s._-]*во|шт\.?|pcs|гост|ост|ту|лист|раздел|lзаг|заготов/iu.test(line) &&
+    !/масштаб|масса|количеств|кол[\s._-]*во|шт\.?|pcs|гост|ост(?![а-яё])|\bту\b|лист\s*\d|раздел|lзаг|заготов|шероховат|допуск/iu.test(line) &&
     !/(?:[A-ZА-ЯЁ0-9]{1,8}\s*\.)?\d{2,}(?:[.-]\d{2,}){2,4}/iu.test(line)
   );
-  const dimensionPattern = /(\d{1,4}(?:[.,]\d{1,3})?)\s*(?:мм|mm)(?![\p{L}\p{N}])/iu;
+
+  const candidates: Array<{ value: number; text: string; score: number }> = [];
+  const addCandidate = (rawValue: string, score: number) => {
+    const value = Number(rawValue.replace(/\s/g, '').replace(',', '.'));
+    if (!Number.isFinite(value) || value < 2 || value > 5000) return;
+    if (quantity !== null && Math.abs(value - quantity) < 0.001) return;
+    if (Math.abs(value - pageNumber) < 0.001 && value <= 100) return;
+    // Skip scale values like 1:5, 1:2.5 and diameters under ~2mm
+    candidates.push({ value, text: rawValue.replace('.', ','), score });
+  };
 
   for (const line of normalizedLines) {
-    const explicitLength = line.match(/(?:\bL(?!заг)\s*=?|длин(?:а|у)\s*[:=]?)\s*(\d{1,4}(?:[.,]\d{1,3})?)/iu);
-    if (explicitLength) return `${explicitLength[1].replace('.', ',')} мм`;
+    // Explicit length labels: L=240, L 240, Длина 180 мм
+    const explicit = line.match(/(?:\bL(?!заг)[а-z]*\s*[:=]?\s*(\d{1,4}(?:[.,]\d{1,3})?))|(?:длин(?:а|у)\s*[:=]?\s*(\d{1,4}(?:[.,]\d{1,3})?))/iu);
+    if (explicit) {
+      const value = explicit[1] || explicit[2];
+      if (value) { addCandidate(value, 100); continue; }
+    }
 
-    const dimension = line.match(dimensionPattern);
-    if (dimension) return `${dimension[1].replace('.', ',')} мм`;
+    // Diameter x length combos: Ø32х190, 32×190, M8х25 -> take the second (length) number
+    const sizeCombo = line.match(/(?:[ØФ⌀直径диам.]*\s*)?\d{1,4}(?:[.,]\d{1,3})?\s*[хx×*]\s*(\d{1,4}(?:[.,]\d{1,3})?)\s*(?:мм)?/iu);
+    if (sizeCombo && !/м\s*\d/iu.test(line.slice(0, (sizeCombo.index ?? 0) + 3))) {
+      addCandidate(sizeCombo[1], 80);
+      continue;
+    }
+
+    // Dimension with units: 240 мм / 240mm
+    const withUnits = line.match(/(\d{1,4}(?:[.,]\d{1,3})?)\s*(?:мм|mm)(?![\p{L}\p{N}])/iu);
+    if (withUnits) {
+      addCandidate(withUnits[1], 60);
+      continue;
+    }
+
+    // Tolerance-dimension lines: "190±0,5" or "~125.5"
+    const tolDim = line.match(/^[~≤≥<> ]*(\d{1,4}(?:[.,]\d{1,3})?)\s*(?:±\s*\d+(?:[.,]\d+)?)?$/u);
+    if (tolDim) {
+      addCandidate(tolDim[1], 40);
+    }
   }
 
-  const decimalDimensions = normalizedLines
-    .map(line => line.match(/^(?:[<>~]\s*)?(\d{1,4}[.,]\d{1,3})$/u)?.[1])
-    .filter((value): value is string => Boolean(value))
-    .map(value => ({ value: Number(value.replace(',', '.')), text: value.replace('.', ',') }))
-    .filter(candidate => candidate.value >= 2 && candidate.value <= 5000 &&
-      candidate.value !== quantity && candidate.value !== pageNumber);
-  const uniqueDecimalDimensions = [...new Map(decimalDimensions.map(candidate => [candidate.value, candidate])).values()];
-  return uniqueDecimalDimensions.length === 1 ? `${uniqueDecimalDimensions[0].text} мм` : '';
+  if (candidates.length === 0) return '';
+  // Largest axial length wins; higher-score patterns break ties
+  candidates.sort((a, b) => b.score - a.score || b.value - a.value);
+  const best = candidates[0];
+  return `${best.text} мм`;
 }
 
 function findMaterial(lines: string[]): string {
@@ -178,7 +275,12 @@ export function parseDrawingPageText(
   const lines = cleanLines(text);
   const designationLines = cleanLines(titleBlock?.designationText || '');
   const titleBlockNameLines = cleanLines(titleBlock?.nameText || '');
-  const titleBlockDesignation = designationLines.length > 0 ? findDesignation(designationLines) : '';
+  let titleBlockDesignation = designationLines.length > 0 ? findDesignation(designationLines) : '';
+  if (!titleBlockDesignation && designationLines.length > 0) {
+    // OCR of the designation cell often yields a compact code without separators — normalize it
+    const cellToken = extractDesignationToken(designationLines.map(normalizeDesignationCell).join(' '));
+    if (cellToken) titleBlockDesignation = cellToken;
+  }
   const designation = titleBlockDesignation || findDesignation(lines);
   if (isSectionDivider(text, designation)) return null;
 
@@ -192,7 +294,14 @@ export function parseDrawingPageText(
   const pageTextName = designation || hasPageNameLabel ? findName(lines, designation) : '';
   const name = titleBlockName || pageTextName || `Чертеж, лист ${pageNumber}`;
   const quantity = findQuantity(text);
-  const partLength = findLength(text, quantity, pageNumber);
+  // Length: scan the drawing field area first, then whole-page text; take the largest axial dimension
+  const lengthCandidates = [
+    findLength([titleBlockNameLines.join('\n'), ...lines].join('\n'), quantity, pageNumber),
+    findLength(text, quantity, pageNumber),
+  ].filter(Boolean);
+  const partLength = lengthCandidates.sort(
+    (a, b) => (parsePartLengthMm(b) ?? 0) - (parsePartLengthMm(a) ?? 0)
+  )[0] || '';
   const material = findMaterial(lines);
   const notes = lines
     .filter(line => /чпу|cnc|техн|покрыт|тверд|шероховат|примечан/iu.test(line))

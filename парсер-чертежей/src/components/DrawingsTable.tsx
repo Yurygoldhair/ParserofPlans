@@ -69,6 +69,67 @@ export const DrawingsTable: React.FC<DrawingsTableProps> = ({
   machinesCount = 1,
 }) => {
   const [search, setSearch] = useState('');
+  // Local edit buffers for free-text cells (Наименование / Обозначение / Длина детали).
+  // Without this, every keystroke re-parses the whole PDF session and recalculates billets,
+  // which makes typing feel laggy and drops characters. Values are committed on blur/Enter.
+  const [cellEdits, setCellEdits] = useState<Record<string, string>>({});
+
+  const cellValue = (item: DrawingItem, field: 'name' | 'designation' | 'partLength'): string => {
+    const key = `${item.id}:${field}`;
+    return cellEdits[key] ?? (item[field] || '');
+  };
+
+  const handleCellChange = (item: DrawingItem, field: 'name' | 'designation' | 'partLength', value: string) => {
+    setCellEdits(prev => ({ ...prev, [`${item.id}:${field}`]: value }));
+  };
+
+  const handleCellCommit = (item: DrawingItem, field: 'name' | 'designation' | 'partLength') => {
+    const key = `${item.id}:${field}`;
+    const value = cellEdits[key];
+    if (value === undefined) return;
+    const trimmed = value.trim();
+    if (trimmed === (item[field] || '')) {
+      setCellEdits(prev => {
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      });
+      return;
+    }
+    if (field === 'partLength') {
+      onUpdateItem({
+        ...item,
+        partLength: trimmed,
+        partLengthSource: trimmed ? 'manual' : undefined,
+      });
+    } else {
+      onUpdateItem({ ...item, [field]: trimmed });
+    }
+    setCellEdits(prev => {
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+  };
+
+  const handleCellKeyDown = (
+    e: React.KeyboardEvent<HTMLInputElement>,
+    item: DrawingItem,
+    field: 'name' | 'designation' | 'partLength'
+  ) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      (e.target as HTMLInputElement).blur();
+    } else if (e.key === 'Escape') {
+      setCellEdits(prev => {
+        const next = { ...prev };
+        delete next[`${item.id}:${field}`];
+        return next;
+      });
+      (e.target as HTMLInputElement).blur();
+    }
+  };
+
   const [filterMissingQtyOnly, setFilterMissingQtyOnly] = useState(false);
   const [filterCncOnly, setFilterCncOnly] = useState(false);
   const [filterPieceStockOnly, setFilterPieceStockOnly] = useState(false);
@@ -572,8 +633,10 @@ export const DrawingsTable: React.FC<DrawingsTableProps> = ({
                           <td className="py-2.5 px-4">
                             <input
                               type="text"
-                              value={item.name}
-                              onChange={(e) => onUpdateItem({ ...item, name: e.target.value })}
+                              value={cellValue(item, 'name')}
+                              onChange={(e) => handleCellChange(item, 'name', e.target.value)}
+                              onBlur={() => handleCellCommit(item, 'name')}
+                              onKeyDown={(e) => handleCellKeyDown(e, item, 'name')}
                               className="w-full bg-transparent hover:bg-slate-800/80 focus:bg-slate-800 text-slate-100 font-medium px-2 py-1 rounded border border-transparent focus:border-blue-500 focus:outline-none transition"
                             />
                             {item.notes && (
@@ -587,8 +650,10 @@ export const DrawingsTable: React.FC<DrawingsTableProps> = ({
                           <td className="py-2.5 px-4 font-mono">
                             <input
                               type="text"
-                              value={item.designation}
-                              onChange={(e) => onUpdateItem({ ...item, designation: e.target.value })}
+                              value={cellValue(item, 'designation')}
+                              onChange={(e) => handleCellChange(item, 'designation', e.target.value)}
+                              onBlur={() => handleCellCommit(item, 'designation')}
+                              onKeyDown={(e) => handleCellKeyDown(e, item, 'designation')}
                               placeholder={item.hasNoStamp ? 'Опознавательный знак...' : 'АБВГ.XXXXXX.XXX'}
                               className={`w-full bg-transparent hover:bg-slate-800/80 focus:bg-slate-800 font-semibold px-2 py-1 rounded border border-transparent focus:border-blue-500 focus:outline-none transition ${
                                 item.hasNoStamp ? 'text-amber-300' : 'text-blue-300'
@@ -627,12 +692,10 @@ export const DrawingsTable: React.FC<DrawingsTableProps> = ({
                             <div className="inline-flex items-center justify-center space-x-1">
                               <input
                                 type="text"
-                                value={item.partLength || ''}
-                                onChange={(e) => onUpdateItem({
-                                  ...item,
-                                  partLength: e.target.value,
-                                  partLengthSource: e.target.value ? 'manual' : undefined,
-                                })}
+                                value={cellValue(item, 'partLength')}
+                                onChange={(e) => handleCellChange(item, 'partLength', e.target.value)}
+                                onBlur={() => handleCellCommit(item, 'partLength')}
+                                onKeyDown={(e) => handleCellKeyDown(e, item, 'partLength')}
                                 placeholder="—"
                                 className="w-20 text-center font-medium bg-slate-800/80 hover:bg-slate-800 border border-slate-700 focus:border-blue-500 text-slate-200 px-1.5 py-1 rounded text-xs focus:outline-none"
                               />
